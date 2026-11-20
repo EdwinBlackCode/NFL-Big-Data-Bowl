@@ -2,7 +2,7 @@ import {
   Bar, BarChart, CartesianGrid, Cell, ErrorBar, LabelList, Legend, Line, LineChart, ReferenceLine,
   ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis, ZAxis,
 } from 'recharts'
-import type { Cuadrante, Ranking, Reloj, Reporte, Validacion } from './api'
+import type { Cuadrante, Ranking, Reloj, Reporte, SegundosPocket, Validacion } from './api'
 import { pct, signo } from './api'
 
 // Paleta categórica validada (orden fijo, nunca rotado) y tinta de texto
@@ -73,27 +73,43 @@ export function GraficaRanking({ d, alto }: { d: Ranking; alto?: number }) {
   )
 }
 
-const DESTACADOS = new Set(['Justin Fields', 'Josh Allen', 'Tom Brady', 'Patrick Mahomes'])
+// QBs destacados y hacia dónde va su etiqueta (para que no se encimen con otros puntos)
+const DESTACADOS: Record<string, { dx: number; dy: number; ancla: 'start' | 'end' }> = {
+  'Justin Fields': { dx: 10, dy: 4, ancla: 'start' },
+  'Josh Allen': { dx: 10, dy: 14, ancla: 'start' },
+  'Kirk Cousins': { dx: 10, dy: 4, ancla: 'start' },
+  'Matthew Stafford': { dx: 10, dy: 4, ancla: 'start' },
+}
+
+function EtiquetaQB(props: { x?: number | string; y?: number | string; value?: string | number; index?: number; nombres: string[] }) {
+  const nombre = props.nombres[props.index ?? 0]
+  const pos = DESTACADOS[nombre] ?? { dx: 10, dy: 4, ancla: 'start' as const }
+  return (
+    <text x={Number(props.x) + pos.dx} y={Number(props.y) + pos.dy} textAnchor={pos.ancla} fontSize={12} fill={TINTA.primaria}
+      stroke="#ffffff" strokeWidth={3} paintOrder="stroke">{props.value}</text>
+  )
+}
 
 export function GraficaCuadrante({ d, ajustada }: { d: Cuadrante; ajustada: boolean }) {
   const puntos = d.qbs.map((q) => ({
     ...q,
-    x: (ajustada ? q.presion_sobre_esperado : q.tasa_presion) * 100,
+    x: (ajustada ? q.temprana_sobre_esperado : q.tasa_presion) * 100,
     y: q.conversion_sack * 100,
     z: q.dropbacks,
-    etiqueta: `${q.nombre} · ${pct(q.conversion_sack, 0)} sack`,
+    etiqueta: `${q.nombre} · ${pct(q.conversion_sack, 1)} sack`,
   }))
-  const resto = puntos.filter((p) => !DESTACADOS.has(p.nombre))
-  const dest = puntos.filter((p) => DESTACADOS.has(p.nombre))
+  const resto = puntos.filter((p) => !(p.nombre in DESTACADOS))
+  const dest = puntos.filter((p) => p.nombre in DESTACADOS)
   const xRef = ajustada ? 0 : d.liga_presion * 100
   const ejeX = ajustada
-    ? 'presión sobre lo esperado (pts) según tiempo con el balón y # de rushers  →  culpa de la línea'
-    : '% de dropbacks con presión  →  más presión recibida'
+    ? 'presión temprana (antes de 2.5 s) sobre lo esperado, en pts  →  culpa de la protección'
+    : '% de dropbacks con presión (PFF)  →  más presión recibida'
   return (
     <ResponsiveContainer width="100%" height={440}>
       <ScatterChart margin={{ top: 16, right: 24, bottom: 32, left: 16 }}>
         <CartesianGrid stroke={TINTA.rejilla} />
-        <XAxis type="number" dataKey="x" name="Presión" domain={ajustada ? [-15, 15] : [15, 55]}
+        <XAxis type="number" dataKey="x" name="Presión" domain={ajustada ? [-10, 12] : [15, 55]}
+          ticks={ajustada ? [-10, -5, 0, 5, 10] : [15, 25, 35, 45, 55]} allowDataOverflow
           tickFormatter={(v: number) => (ajustada ? signo(v, 0) : `${v}%`)} {...EJE}
           label={{ value: ejeX, position: 'insideBottom', offset: -18, fill: TINTA.secundaria, fontSize: 12 }} />
         <YAxis type="number" dataKey="y" name="Sacks por presión" domain={[0, 40]} tickFormatter={(v: number) => `${v}%`} {...EJE} width={56}
@@ -109,8 +125,8 @@ export function GraficaCuadrante({ d, ajustada }: { d: Cuadrante; ajustada: bool
           return (
             <div className="rounded-md border border-gray-200 bg-white px-3 py-2 text-xs shadow">
               <p className="font-semibold text-gray-900">{q.nombre} ({q.equipo})</p>
-              <p>Presión: {pct(q.tasa_presion, 1)} [{pct(q.ic_presion[0])}–{pct(q.ic_presion[1])}] de {q.dropbacks} dropbacks</p>
-              <p>Esperada por su tiempo con el balón: {pct(q.presion_esperada, 1)} ({signo(q.presion_sobre_esperado * 100)} pts)</p>
+              <p>Presión (PFF): {pct(q.tasa_presion, 1)} de {q.dropbacks} dropbacks</p>
+              <p>Presión temprana: {pct(q.presion_temprana, 1)} vs {pct(q.temprana_esperada, 1)} esperada ({signo(q.temprana_sobre_esperado * 100)} pts)</p>
               <p>Tiempo mediano para lanzar: {q.tiempo_lanzamiento ?? '–'} s · scrambles: {q.scrambles}</p>
               <p>Sack por presión: {pct(q.conversion_sack, 1)} [{pct(q.ic_conversion[0])}–{pct(q.ic_conversion[1])}] de {q.presionadas}</p>
             </div>
@@ -119,9 +135,33 @@ export function GraficaCuadrante({ d, ajustada }: { d: Cuadrante; ajustada: bool
         <Legend verticalAlign="top" height={28} />
         <Scatter name="Otros QBs" data={resto} fill={SERIES[0]} fillOpacity={0.55} isAnimationActive={false} />
         <Scatter name="Destacados" data={dest} fill={SERIES[1]} isAnimationActive={false}>
-          <LabelList dataKey="etiqueta" position="right" fill={TINTA.primaria} fontSize={12} />
+          <LabelList dataKey="etiqueta" content={(p) => <EtiquetaQB {...(p as object)} nombres={dest.map((q) => q.nombre)} />} />
         </Scatter>
       </ScatterChart>
+    </ResponsiveContainer>
+  )
+}
+
+export function GraficaSegundos({ d, alto }: { d: SegundosPocket; alto?: number }) {
+  const filas = d.equipos.map((e) => ({
+    equipo: e.equipo, valor: e.spse_por_partido,
+    error: [e.spse_por_partido - e.ic_por_partido[0], e.ic_por_partido[1] - e.spse_por_partido],
+    claro: e.ic[0] > 0 || e.ic[1] < 0,
+  })).sort((a, b) => b.valor - a.valor)
+  return (
+    <ResponsiveContainer width="100%" height={alto ?? filas.length * 18 + 50}>
+      <BarChart data={filas} layout="vertical" margin={{ top: 8, right: 48, bottom: 8, left: 0 }} barCategoryGap={3}>
+        <CartesianGrid stroke={TINTA.rejilla} horizontal={false} />
+        <XAxis type="number" {...EJE} tickFormatter={(v: number) => `${signo(v, 0)} s`} />
+        <YAxis type="category" dataKey="equipo" width={44} {...EJE} interval={0} />
+        <ReferenceLine x={0} stroke={TINTA.secundaria} />
+        <Tooltip formatter={(v) => [`${signo(Number(v))} s de pocket por partido`, 'sobre lo esperado']} />
+        <Bar dataKey="valor" isAnimationActive={false}>
+          {filas.map((f) => <Cell key={f.equipo} fill={f.valor >= 0 ? SERIES[0] : SERIES[1]} fillOpacity={f.claro ? 1 : 0.35} />)}
+          <ErrorBar dataKey="error" width={3} strokeWidth={1} stroke={TINTA.primaria} direction="x" />
+          <LabelList dataKey="valor" position="right" fill={TINTA.secundaria} fontSize={10} formatter={(v) => signo(Number(v))} />
+        </Bar>
+      </BarChart>
     </ResponsiveContainer>
   )
 }
@@ -129,10 +169,11 @@ export function GraficaCuadrante({ d, ajustada }: { d: Cuadrante; ajustada: bool
 export function TarjetaReporte({ d }: { d: Reporte }) {
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-3 gap-3 text-center">
-        <Dato titulo={`${d.ofensiva} cede (3 s)`} valor={pct(d.presion_3s.ofensiva_cede)} />
-        <Dato titulo={`${d.defensa} genera (3 s)`} valor={pct(d.presion_3s.defensa_genera)} />
-        <Dato titulo="Liga (3 s)" valor={pct(d.presion_3s.liga)} />
+      <div className="grid grid-cols-2 gap-3 text-center md:grid-cols-4">
+        <Dato titulo={`${d.ofensiva} cede (3 s)`} valor={pct(d.presion_3s.ofensiva_cede)} nota={`liga ${pct(d.presion_3s.liga)}`} />
+        <Dato titulo={`${d.defensa} genera (3 s)`} valor={pct(d.presion_3s.defensa_genera)} nota={`liga ${pct(d.presion_3s.liga)}`} />
+        <Dato titulo={`Pocket de ${d.ofensiva}`} valor={`${signo(d.spse_ofensiva.spse_por_partido)} s`} nota="por partido sobre lo esperado" />
+        <Dato titulo={`${d.defensa} roba`} valor={`${signo(d.spse_defensa.spse_por_partido)} s`} nota="por partido sobre lo esperado" />
       </div>
       <ul className="list-disc space-y-1 pl-5 text-sm text-gray-800">
         {d.recomendaciones.map((r) => <li key={r}>{r}</li>)}
@@ -161,9 +202,12 @@ export function TablaValidacion({ v }: { v: Validacion }) {
         filas={v.sensibilidad.map((s) => [`${s.umbral_yardas} yd${s.umbral_yardas === v.umbral_yardas ? ' (elegido)' : ''}`,
           s.kappa.toFixed(2), pct(s.acuerdo, 1), pct(s.precision), pct(s.recall), pct(s.tasa_presion)])} />
       <p className="text-xs text-gray-500">
+        Medido solo con la distancia del tracking en {v.jugadas.toLocaleString()} jugadas sin sack (un sack siempre es presión en PFF y contarlo inflaría el acuerdo).
         Decir siempre "sin presión" ya acierta el {pct(v.acuerdo_trivial)}, por eso elegimos el umbral por kappa (acuerdo corregido por azar) y no por acuerdo bruto.
-        Los {v.sacks_sin_presion_tracking} sacks en los que ningún rusher llegó a {v.umbral_yardas} yd se cuentan como presión al momento del sack.
-        En {v.empates_presion_y_pase} jugadas la presión y el pase ocurren en el mismo cuadro (0.1 s); se cuentan como presión.
+        Validación cruzada por partido (5 particiones): el umbral elegido fue {[...new Set(v.validacion_cruzada.map((c) => c.umbral_elegido))].join(', ')} yd
+        y el kappa fuera de muestra fue {v.kappa_cv.toFixed(2)}.
+        En el reloj, los {v.sacks_sin_presion_tracking} sacks sin rusher a {v.umbral_yardas} yd cuentan como presión, y las {v.empates_presion_y_pase} jugadas
+        con presión y pase en el mismo cuadro (0.1 s) también.
       </p>
     </div>
   )

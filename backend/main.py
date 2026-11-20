@@ -36,6 +36,8 @@ async def ciclo(app: FastAPI):
     analisis.tablas_jugadores()
     analisis.cuadrante_qb()
     analisis.resumen()
+    analisis.segundos_pocket("ofensiva")
+    analisis.segundos_pocket("defensa")
     yield
 
 
@@ -50,6 +52,11 @@ def health() -> dict:
 @app.get("/api/resumen")
 def api_resumen() -> dict:
     return analisis.resumen()
+
+
+@app.get("/api/segundos-pocket")
+def api_segundos_pocket(lado: str = Query("ofensiva", pattern="^(ofensiva|defensa)$")) -> dict:
+    return analisis.segundos_pocket(lado)
 
 
 @app.get("/api/validacion")

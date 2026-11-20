@@ -26,10 +26,16 @@ export type Resumen = {
 
 export type Concordancia = { acuerdo: number; kappa: number; precision: number; recall: number; f1: number; tasa_presion: number }
 export type Validacion = Concordancia & {
-  umbral_yardas: number; jugadas: number; acuerdo_trivial: number
+  umbral_yardas: number; jugadas: number; acuerdo_trivial: number; kappa_con_sacks: number; kappa_cv: number
   sacks_sin_presion_tracking: number; empates_presion_y_pase: number
   sensibilidad: Array<Concordancia & { umbral_yardas: number }>
+  validacion_cruzada: Array<Concordancia & { particion: number; umbral_elegido: number }>
 }
+
+export type SPSE = {
+  equipo: string; jugadas: number; spse: number; ic: number[]; spse_por_partido: number; ic_por_partido: number[]; perdidos_observados: number
+}
+export type SegundosPocket = { lado: 'ofensiva' | 'defensa'; ventana_s: number; liga_perdidos: number; equipos: SPSE[] }
 
 export type FilaReloj = { nombre: string; n: number; a_2_5s: number; a_3_0s: number; a_4_0s: number; segundos_hasta_25pct: number | null }
 export type Reloj = {
@@ -49,12 +55,13 @@ export type Ranking = { posicion: 'ol' | 'rushers'; orden?: string; min_snaps: n
 
 export type QB = {
   nflId: number; nombre: string; equipo: string; dropbacks: number; presionadas: number; sacks: number; scrambles: number
-  tasa_presion: number; ic_presion: number[]; presion_esperada: number; presion_sobre_esperado: number; ic_sobre_esperado: number[]
+  tasa_presion: number; ic_presion: number[]
+  presion_temprana: number; temprana_esperada: number; temprana_sobre_esperado: number; ic_temprana_sobre_esperado: number[]
   tiempo_lanzamiento: number | null
   conversion_sack: number; ic_conversion: number[]; tasa_sack: number; ic_sack: number[]
 }
 export type Cuadrante = {
-  min_dropbacks: number; liga_presion: number; liga_conversion: number; liga_tiempo_lanzamiento: number
+  min_dropbacks: number; liga_presion: number; liga_conversion: number; liga_tiempo_lanzamiento: number; liga_temprana: number
   n_presionadas_liga: number; qbs: QB[]
 }
 
@@ -63,6 +70,7 @@ export type Reporte = {
   presion_3s: { ofensiva_cede: number; defensa_genera: number; liga: number }
   presion_2_5s: { ofensiva_cede: number; defensa_genera: number; liga: number }
   ventanas_ruta: Array<{ ruta: string; segundos: number; ofensiva: number; liga: number }>
+  spse_ofensiva: SPSE; spse_defensa: SPSE
   fuentes_presion: Array<{ fuente: string; porcentaje: number }>
   linea_ofensiva: Array<{ nflId: number; nombre: string; alineacion: string; snaps: number; tasa_ajustada: number
     sobre_lo_esperado_100: number; ic_bajo_100: number; ic_alto_100: number; tempranas_100: number }>
@@ -73,8 +81,8 @@ export type Reporte = {
 
 export type RespuestaCoach = {
   pregunta: string; respuesta: string; fuente: string
-  herramienta: 'get_pocket_clock' | 'get_player_ranking' | 'get_matchup_report' | null
-  datos: Reloj | Ranking | Reporte | null
+  herramienta: 'get_pocket_clock' | 'get_player_ranking' | 'get_matchup_report' | 'get_pocket_seconds' | null
+  datos: Reloj | Ranking | Reporte | SegundosPocket | null
   error?: string
 }
 

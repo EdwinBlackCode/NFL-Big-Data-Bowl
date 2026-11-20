@@ -29,8 +29,11 @@ ALINEACION_OL = ["LT", "LG", "C", "RG", "RT"]
 TEMPRANA_S = 2.5                              # presión "temprana": antes de que salga una ruta rápida
 # tiempo típico para lanzar cada familia de rutas (referencia de entrenadores; aproximado)
 VENTANAS_RUTA = [("rápidas (slant, hitch)", 2.5), ("intermedias (dig, out)", 3.0), ("profundas (post, go)", 3.5)]
-CORTES_TIEMPO = [0, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, np.inf]
+VENTANA_S = 4.0       # ventana del pocket para "segundos perdidos por presión"
+CELDA = ["grupo_rushers", "tipo_jugada", "cobertura"]   # plan de la jugada usado para la presión esperada
+MIN_CELDA = 50
 GRID = [round(x, 1) for x in np.arange(0.5, 5.01, 0.1)]
+GRID_CV = [round(x, 2) for x in np.arange(1.0, 3.01, 0.25)]
 
 
 # ---------------------------------------------------------------- utilidades
@@ -126,6 +129,42 @@ def _t25(curva: dict[float, float]) -> float | None:
     return next((t for t in GRID if curva[t] >= 0.25), None)
 
 
+def _esperado(base: pd.DataFrame, objetivo: pd.DataFrame, col: str) -> pd.Series:
+    """Valor esperado de `col` para cada jugada de `objetivo`, según jugadas de `base` con el mismo plan
+    (rushers x tipo de jugada x cobertura). Si la celda tiene menos de MIN_CELDA jugadas, usa rushers x tipo de jugada."""
+    fino = base.groupby(CELDA)[col].agg(m_f="mean", n_f="size").reset_index()
+    grueso = base.groupby(CELDA[:2])[col].mean().rename("m_g").reset_index()
+    o = objetivo[CELDA].reset_index(drop=True).merge(fino, on=CELDA, how="left").merge(grueso, on=CELDA[:2], how="left")
+    e = np.where(o.n_f >= MIN_CELDA, o.m_f, o.m_g)
+    return pd.Series(e, index=objetivo.index).fillna(float(base[col].mean()))
+
+
+@lru_cache(maxsize=2)
+def segundos_pocket(lado: str = "ofensiva") -> dict:
+    """Segundos de pocket sobre lo esperado (SPSE), por equipo.
+
+    Por jugada, 'segundos perdidos' = cuánto antes del segundo 4 llegó la presión (0 si no llegó). Lo esperado sale de
+    las jugadas del RESTO de la liga con el mismo plan (rushers, tipo de jugada, cobertura). Ofensiva: SPSE > 0 = su
+    protección compra más tiempo del esperado. Defensa: SPSE > 0 = roba más tiempo del esperado.
+    """
+    r = datos()["reloj"]
+    col = "possessionTeam" if lado == "ofensiva" else "defensiveTeam"
+    out = []
+    for eq in sorted(r[col].dropna().unique()):
+        sub, base = r[r[col] == eq], r[r[col] != eq]
+        dif = _esperado(base, sub, "perdido") - sub.perdido
+        if lado != "ofensiva":
+            dif = -dif
+        n = len(sub)
+        m, se = float(dif.mean()), float(dif.std(ddof=1) / math.sqrt(n))
+        jpp = n / max(1, sub.index.get_level_values("gameId").nunique())   # jugadas de pase por partido
+        out.append({"equipo": eq, "jugadas": n, "spse": round(m, 3), "ic": [round(m - 1.96 * se, 3), round(m + 1.96 * se, 3)],
+                    "spse_por_partido": round(m * jpp, 2), "ic_por_partido": [round((m - 1.96 * se) * jpp, 2), round((m + 1.96 * se) * jpp, 2)],
+                    "perdidos_observados": round(float(sub.perdido.mean()), 3)})
+    out.sort(key=lambda x: -x["spse"])
+    return {"lado": lado, "ventana_s": VENTANA_S, "liga_perdidos": round(float(r.perdido.mean()), 3), "equipos": out}
+
+
 # ---------------------------------------------------------------- carga
 @lru_cache(maxsize=1)
 def datos() -> dict:
@@ -173,18 +212,39 @@ def datos() -> dict:
     reloj["T"] = reloj.t_presion.fillna(reloj.t_fin)
     reloj["E"] = (reloj.t_presion.notna() | es_sack).astype(int)
 
-    # ---- validación contra PFF y sensibilidad del umbral
-    y = reloj.presion_pff.to_numpy()
-    sensibilidad = []
-    for u in UMBRALES_SENSIBILIDAD:
-        e = ((reloj.min_dist < u) | es_sack).to_numpy()
-        sensibilidad.append({"umbral_yardas": u, **concordancia(e, y)})
+    # ---- variables por jugada para las métricas
+    # Sin censura (toda jugada termina en presión o balón fuera), el área bajo la curva de incidencia entre 0.5 y 4 s
+    # es exactamente el promedio por jugada de estos "segundos perdidos": cuánto antes de los 4 s llegó la presión.
+    reloj["perdido"] = np.where(reloj.E == 1, (VENTANA_S - reloj["T"].clip(lower=INICIO_S)).clip(lower=0), 0.0)
+    reloj["temprana"] = ((reloj.E == 1) & (reloj["T"] < TEMPRANA_S)).astype(int)
+    reloj["grupo_rushers"] = np.select([reloj.rushers <= 4, reloj.rushers == 5], ["4 o menos", "5"], "6 o más")
+    reloj["cobertura"] = reloj.pff_passCoverageType.where(reloj.pff_passCoverageType.isin(["Man", "Zone"]), "Otra")
+
+    # ---- validación contra PFF: SOLO con la distancia del tracking y sin jugadas de sack
+    # (un sack siempre es presión en PFF; incluirlo forzado como positivo inflaría el acuerdo)
+    ns = (~es_sack).to_numpy()
+    y = reloj.presion_pff.to_numpy()[ns]
+    md = reloj.min_dist.to_numpy()[ns]
+    sensibilidad = [{"umbral_yardas": u, **concordancia(md < u, y)} for u in UMBRALES_SENSIBILIDAD]
+    # validación cruzada por partido: se elige el umbral en 4/5 de los partidos y se evalúa en el 1/5 restante
+    juegos = reloj.index.get_level_values("gameId").to_numpy()[ns]
+    unicos = np.unique(juegos)
+    fold_de = dict(zip(unicos, np.random.default_rng(0).permutation(len(unicos)) % 5))
+    fold = np.array([fold_de[g] for g in juegos])
+    cv = []
+    for k in range(5):
+        tr, te = fold != k, fold == k
+        mejor = max(GRID_CV, key=lambda u: concordancia(md[tr] < u, y[tr])["kappa"])
+        cv.append({"particion": k + 1, "umbral_elegido": mejor, **concordancia(md[te] < mejor, y[te])})
     validacion = {
-        "umbral_yardas": UMBRAL_YD, "jugadas": int(len(reloj)), **concordancia(reloj.E.to_numpy(), y),
+        "umbral_yardas": UMBRAL_YD, "jugadas": int(ns.sum()), **concordancia(md < UMBRAL_YD, y),
         "acuerdo_trivial": round(float(1 - y.mean()), 3),
+        "kappa_con_sacks": concordancia(reloj.E.to_numpy(), reloj.presion_pff.to_numpy())["kappa"],
         "sacks_sin_presion_tracking": int((es_sack & reloj.t_presion.isna()).sum()),
         "empates_presion_y_pase": int(((reloj.t_presion == reloj.t_fin) & ~es_sack).sum()),
         "sensibilidad": sensibilidad,
+        "validacion_cruzada": cv,
+        "kappa_cv": round(float(np.mean([c["kappa"] for c in cv])), 3),
     }
 
     return dict(plays=plays, pff=pff, rush=rush, jugadas=jugadas, reloj=reloj, games=games, validacion=validacion,
@@ -387,24 +447,26 @@ def ranking(posicion: str = "ol", equipo: str | None = None, top: int = 15, orde
 def cuadrante_qb() -> dict:
     d = datos()
     pff, jug, nombres = d["pff"], d["jugadas"], d["nombres"]
+    r = d["reloj"]
     qb = pff[pff.pff_role == "Pass"][["gameId", "playId", "nflId"]].join(
-        jug[["presion_pff", "passResult", "possessionTeam", "rushers"]], on=["gameId", "playId"])
-    qb = qb.join(d["reloj"][["t_fin"]], on=["gameId", "playId"])
+        jug[["presion_pff", "passResult", "possessionTeam"]], on=["gameId", "playId"])
+    qb = qb.join(r[["t_fin", "temprana"] + CELDA], on=["gameId", "playId"])
     qb["sack"] = (qb.passResult == "S").astype(int)
     qb["sack_bajo_presion"] = ((qb.passResult == "S") & (qb.presion_pff == 1)).astype(int)
     qb["lanzado"] = qb.passResult.isin(["C", "I", "IN"])
     liga_presion = float(qb.presion_pff.mean())
 
-    # Presión esperada según cuánto tiempo tuvo el QB el balón y cuántos rushers enfrentó.
-    # Lo que queda (observada - esperada) es lo que NO se explica porque el QB retenga el balón: más atribuible a la línea.
-    grupo = np.select([qb.rushers <= 4, qb.rushers == 5], ["4 o menos", "5"], "6 o más")
-    bin_t = pd.cut(qb.t_fin, CORTES_TIEMPO, right=False)
-    qb["esperada"] = qb.groupby([bin_t, grupo], observed=True).presion_pff.transform("mean").fillna(liga_presion)
+    # Eje X: presión TEMPRANA (tracking, antes de 2.5 s) contra la esperada para el mismo plan de jugada
+    # (rushers, tipo de jugada, cobertura). Antes de 2.5 s el QB casi no puede provocar la presión reteniendo el balón,
+    # así que el exceso apunta a la protección. No se condiciona en el tiempo hasta soltar, que depende de la presión.
+    con_t = qb.dropna(subset=["temprana"]).copy()
+    con_t["esp_temprana"] = _esperado(r, con_t, "temprana")
+    t = con_t.groupby("nflId").agg(n_t=("temprana", "size"), tempranas=("temprana", "sum"), esp_temprana=("esp_temprana", "mean"))
 
     g = qb.groupby("nflId").agg(dropbacks=("sack", "size"), presionadas=("presion_pff", "sum"), sacks=("sack", "sum"),
-                                sacks_bajo_presion=("sack_bajo_presion", "sum"), esperada=("esperada", "mean"),
+                                sacks_bajo_presion=("sack_bajo_presion", "sum"),
                                 scrambles=("passResult", lambda s: int((s == "R").sum())),
-                                equipo=("possessionTeam", lambda s: s.mode().iat[0]))
+                                equipo=("possessionTeam", lambda s: s.mode().iat[0])).join(t)
     g["tiempo_lanzamiento"] = qb[qb.lanzado].groupby("nflId").t_fin.median()
     liga_conv = float(qb.sack_bajo_presion.sum() / qb.presion_pff.sum())
     liga_tiempo = float(qb[qb.lanzado].t_fin.median())
@@ -413,19 +475,21 @@ def cuadrante_qb() -> dict:
     for nflId, f in g.iterrows():
         tp = f.presionadas / f.dropbacks
         tc = f.sacks_bajo_presion / f.presionadas if f.presionadas else 0
-        icp = wilson(f.presionadas, f.dropbacks)
+        tt = f.tempranas / f.n_t
+        ict = wilson(f.tempranas, f.n_t)
         out.append({"nflId": int(nflId), "nombre": nombres.get(nflId, str(nflId)), "equipo": f.equipo,
                     "dropbacks": int(f.dropbacks), "presionadas": int(f.presionadas), "sacks": int(f.sacks), "scrambles": int(f.scrambles),
-                    "tasa_presion": round(tp, 4), "ic_presion": [round(x, 4) for x in icp],
-                    "presion_esperada": round(float(f.esperada), 4),
-                    "presion_sobre_esperado": round(tp - float(f.esperada), 4),
-                    "ic_sobre_esperado": [round(x - float(f.esperada), 4) for x in icp],
+                    "tasa_presion": round(tp, 4), "ic_presion": [round(x, 4) for x in wilson(f.presionadas, f.dropbacks)],
+                    "presion_temprana": round(tt, 4), "temprana_esperada": round(float(f.esp_temprana), 4),
+                    "temprana_sobre_esperado": round(tt - float(f.esp_temprana), 4),
+                    "ic_temprana_sobre_esperado": [round(x - float(f.esp_temprana), 4) for x in ict],
                     "tiempo_lanzamiento": _limpio(f.tiempo_lanzamiento),
                     "conversion_sack": round(tc, 4), "ic_conversion": [round(x, 4) for x in wilson(f.sacks_bajo_presion, f.presionadas)],
                     "tasa_sack": round(f.sacks / f.dropbacks, 4), "ic_sack": [round(x, 4) for x in wilson(f.sacks, f.dropbacks)]})
     out.sort(key=lambda x: -x["conversion_sack"])
     return {"min_dropbacks": MIN_DROPBACKS_QB, "liga_presion": round(liga_presion, 4), "liga_conversion": round(liga_conv, 4),
-            "liga_tiempo_lanzamiento": round(liga_tiempo, 2), "n_presionadas_liga": int(qb.presion_pff.sum()), "qbs": out}
+            "liga_tiempo_lanzamiento": round(liga_tiempo, 2), "liga_temprana": round(float(r.temprana.mean()), 4),
+            "n_presionadas_liga": int(qb.presion_pff.sum()), "qbs": out}
 
 
 # ---------------------------------------------------------------- 4. Reporte por partido
@@ -503,9 +567,17 @@ def reporte_partido(ofensiva: str, defensa: str) -> dict:
         fuentes = [{"fuente": k, "porcentaje": round(float(v), 3)} for k, v in comp.items()]
         libre = float(comp.get("Sin bloqueador asignado", 0.0))
         liga_libre = float(at[at.fuente == "Sin bloqueador asignado"].credito.sum() / at.drop_duplicates(["gameId", "playId"]).shape[0])
-        if libre > liga_libre + 0.05:
-            rec.append(f"El {libre:.0%} de las presiones que llegan al QB de {ofensiva} vienen de rushers sin bloqueador asignado (liga "
-                       f"{liga_libre:.0%}): revisar el ajuste de protección contra blitz y stunts antes que a los linieros.")
+        if _comparar(libre, tot, liga_libre) > 0:
+            rec.append(f"El {libre:.0%} de las presiones que llegan al QB de {ofensiva} vienen de un rusher que no tenía bloqueador asignado "
+                       f"(liga {liga_libre:.0%}, diferencia significativa). Puede ser un blitz no recogido, un stunt o un error de asignación: "
+                       f"revisar en video las llamadas de protección antes de culpar a un liniero.")
+    # 5. segundos de pocket sobre lo esperado (métrica propia)
+    spse_of = next(x for x in segundos_pocket("ofensiva")["equipos"] if x["equipo"] == ofensiva)
+    spse_de = next(x for x in segundos_pocket("defensa")["equipos"] if x["equipo"] == defensa)
+    if spse_of["ic"][0] > 0 or spse_of["ic"][1] < 0:
+        gana = spse_of["spse"] > 0
+        rec.append(f"Segundos de pocket: la protección de {ofensiva} {'compra' if gana else 'pierde'} {abs(spse_of['spse_por_partido']):.1f} s "
+                   f"de pocket por partido respecto a lo esperado para sus mismos planes de jugada ({spse_of['spse']:+.3f} s por jugada).")
 
     cols_ol = ["nombre", "alineacion", "snaps", "tasa_ajustada", "sobre_lo_esperado_100", "ic_bajo_100", "ic_alto_100", "tempranas_100"]
     cols_r = ["nombre", "alineacion", "frente_comun", "snaps", "presiones", "sacks", "tasa_ajustada"]
@@ -513,6 +585,7 @@ def reporte_partido(ofensiva: str, defensa: str) -> dict:
             "presion_3s": {"ofensiva_cede": round(go[3.0], 3), "defensa_genera": round(gd[3.0], 3), "liga": round(gl[3.0], 3)},
             "presion_2_5s": {"ofensiva_cede": round(go[2.5], 3), "defensa_genera": round(gd[2.5], 3), "liga": round(gl[2.5], 3)},
             "ventanas_ruta": [{"ruta": nombre, "segundos": s, "ofensiva": round(go[s], 3), "liga": round(gl[s], 3)} for nombre, s in VENTANAS_RUTA],
+            "spse_ofensiva": spse_of, "spse_defensa": spse_de,
             "fuentes_presion": fuentes,
             "linea_ofensiva": _filas(linea, cols_ol), "rushers_rivales": _filas(rivales.head(5), cols_r),
             "recomendaciones": rec}
