@@ -1,0 +1,20 @@
+.venv/
+.hackathon/.tools/
+.hackathon/.cache/
+.hackathon/.bootstrap/
+.hackathon/setup.log
+setup-log.txt
+node_modules/
+dist/
+__pycache__/
+
+# Llaves y credenciales: nunca al repositorio
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.aws/
+
+# Dataset original (~1 GB): no se sube a GitHub; el .zip de entrega sí lo incluye
+data/nfl-big-data-bowl-regional-event-data-main/
